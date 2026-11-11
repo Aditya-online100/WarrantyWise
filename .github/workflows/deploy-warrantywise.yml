@@ -1,0 +1,102 @@
+name: Build, Test, and Deploy WarrantyWise to Azure App Service
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Required for OIDC passwordless Azure login
+  contents: read
+
+env:
+  AZURE_WEBAPP_NAME: warrantywise-web-123
+  NODE_VERSION: '22.x'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install backend and frontend dependencies
+        run: |
+          npm ci --prefix backend
+          npm ci --prefix frontend
+
+      - name: Run backend integration and unit test suite
+        run: npm test --prefix backend
+
+      - name: Build React production bundle (outputs to frontend/dist/)
+        run: npm run build --prefix frontend
+
+      - name: Assemble clean Linux production package
+        run: |
+          rm -rf deploy-package
+          mkdir -p deploy-package/frontend deploy-package/backend
+
+          cp package.json deploy-package/
+          cp -r database deploy-package/database
+
+          # Copy backend source and lockfiles only (exclude test-created data/uploads and dev/test artifacts)
+          rsync -a \
+            --exclude='/node_modules' \
+            --exclude='/data' \
+            --exclude='/uploads' \
+            --exclude='/tests' \
+            --exclude='/.env*' \
+            backend/ deploy-package/backend/
+
+          # Install clean Linux production-only backend dependencies
+          npm ci --prefix deploy-package/backend --omit=dev
+
+          # Include compiled Vite bundle at frontend/dist (matches server.js ../frontend/dist)
+          cp -r frontend/dist deploy-package/frontend/dist
+
+          # Zip cleanly for Azure App Service deployment
+          (cd deploy-package && zip -qr ../warrantywise-release.zip .)
+
+      - name: Upload deployment package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warrantywise-release
+          path: warrantywise-release.zip
+          retention-days: 5
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Download deployment package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: warrantywise-release
+
+      # Uses Federated Identity (OIDC) — preserves passwordless Azure auth.
+      # Requires GitHub Repository Secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+      - name: Login to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy prebuilt package to Azure Linux App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          package: warrantywise-release.zip
+

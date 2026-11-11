@@ -47,7 +47,10 @@ BEGIN
         created_at
     )
     SELECT 
-        d.user_id,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM dbo.Users u WHERE u.id = d.user_id) THEN d.user_id
+            ELSE NULL
+        END,
         'PRODUCT_DELETED',
         'Product',
         d.id,

@@ -14,6 +14,8 @@
     "build": "npm run build --prefix frontend",
     "azure:init-db": "node backend/scripts/initAzureSql.js",
     "azure:migrate": "node backend/scripts/migrateLocalToAzure.js",
+    "azure:test-db": "node backend/scripts/testAzureSql.js",
+    "azure:test-blob": "node backend/scripts/testAzureBlob.js",
     "postinstall": "node -e \"const fs=require('fs'),cp=require('child_process'); cp.execSync('npm install --prefix backend',{stdio:'inherit'}); if(!fs.existsSync('frontend/dist')){ cp.execSync('npm install --prefix frontend && npm run build --prefix frontend',{stdio:'inherit'}); }\""
   },
   "keywords": [

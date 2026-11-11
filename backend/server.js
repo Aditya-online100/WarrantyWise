@@ -120,6 +120,7 @@ app.use(errorHandler);
 async function startServer() {
   try {
     await db.initDb();
+    blobStorage.initStorage();
     const server = app.listen(config.PORT, () => {
       console.log(`=======================================================`);
       console.log(`🚀 WarrantyWise Backend Server running on port ${config.PORT}`);

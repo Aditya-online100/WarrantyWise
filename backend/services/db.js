@@ -28,7 +28,7 @@ function shouldUseManagedIdentity(sqlCfg = config.AZURE_SQL) {
   if (authMode === 'managed_identity' || authMode === 'aad' || authMode === 'msi') {
     return true;
   }
-  if (authMode === 'sql' && hasSqlCredentials) {
+  if (authMode === 'sql') {
     return false;
   }
   // When no SQL username/password is provided, default to Azure Managed Identity
@@ -40,11 +40,16 @@ function shouldUseManagedIdentity(sqlCfg = config.AZURE_SQL) {
  * Prefers Azure Managed Identity via DefaultAzureCredential (no SQL password needed).
  */
 function buildAzureSqlConfig(sqlCfg = config.AZURE_SQL) {
+  const server = String(sqlCfg?.server || '').trim();
+  if (!server) {
+    throw new Error('DB_SERVER must be configured to build Azure SQL connection config.');
+  }
+
   const useManagedIdentity = shouldUseManagedIdentity(sqlCfg);
   const clientId = String(sqlCfg?.managedIdentityClientId || '').trim();
 
   const poolConfig = {
-    server: String(sqlCfg.server || '').trim(),
+    server,
     database: String(sqlCfg.database || 'WarrantyWiseDB').trim(),
     port: parseInt(sqlCfg.port, 10) || 1433,
     pool: {
@@ -71,6 +76,10 @@ function buildAzureSqlConfig(sqlCfg = config.AZURE_SQL) {
         options: clientId ? { clientId } : {}
       }
     };
+  }
+
+  if (!sqlCfg?.user || !sqlCfg?.password) {
+    throw new Error('DB_USER and DB_PASSWORD are required when DB_AUTH_MODE=sql.');
   }
 
   return {
@@ -198,6 +207,15 @@ async function initDb() {
       }
       console.warn(`[Database] Azure SQL connection failed: ${err.message}. Falling back to Local SQLite mode.`);
     }
+  } else if (
+    (config.NODE_ENV === 'production' || process.env.DB_STRICT_AZURE === 'true') &&
+    process.env.ALLOW_SQLITE_IN_PRODUCTION !== 'true'
+  ) {
+    const err = new Error(
+      'DB_SERVER must be configured in production to use Azure SQL Database. Local SQLite fallback is disabled in production.'
+    );
+    console.error(`[Database] Fatal configuration error: ${err.message}`);
+    throw err;
   }
 
   // Local SQLite Initialization using sql.js

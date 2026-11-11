@@ -12,7 +12,9 @@
     "dev": "node --watch server.js",
     "test": "node tests/api.test.js",
     "azure:init-db": "node scripts/initAzureSql.js",
-    "azure:migrate": "node scripts/migrateLocalToAzure.js"
+    "azure:migrate": "node scripts/migrateLocalToAzure.js",
+    "azure:test-db": "node scripts/testAzureSql.js",
+    "azure:test-blob": "node scripts/testAzureBlob.js"
   },
   "dependencies": {
     "@azure/identity": "^3.4.2",

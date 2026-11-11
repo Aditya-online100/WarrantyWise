@@ -1,5 +1,18 @@
 const db = require('../services/db');
+const blobStorage = require('../services/blobStorage');
 const { logActivity } = require('../services/activityLogService');
+
+function parsePositiveInt(val) {
+  if (val === undefined || val === null) return null;
+  if (typeof val === 'number') {
+    return Number.isSafeInteger(val) && val > 0 ? val : NaN;
+  }
+  const trimmed = String(val).trim();
+  if (trimmed === '') return null;
+  if (!/^\d+$/.test(trimmed)) return NaN;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : NaN;
+}
 
 /**
  * Helper to compute status and days remaining for a warranty
@@ -55,9 +68,13 @@ async function getProducts(req, res, next) {
 
     const params = [userId];
 
-    if (category_id) {
+    if (category_id !== undefined && String(category_id).trim() !== '') {
+      const parsedCategoryId = parsePositiveInt(category_id);
+      if (!parsedCategoryId || Number.isNaN(parsedCategoryId)) {
+        return res.status(400).json({ success: false, message: 'Category ID must be a valid positive integer.' });
+      }
       sql += ' AND p.category_id = ?';
-      params.push(parseInt(category_id, 10));
+      params.push(parsedCategoryId);
     }
 
     if (brand) {
@@ -127,7 +144,10 @@ async function getProducts(req, res, next) {
  */
 async function getProductById(req, res, next) {
   try {
-    const { id } = req.params;
+    const productId = parsePositiveInt(req.params.id);
+    if (!productId || Number.isNaN(productId)) {
+      return res.status(400).json({ success: false, message: 'Product ID must be a valid positive integer.' });
+    }
     const userId = req.user.id;
     const isAdmin = req.user.role === 'Admin';
 
@@ -140,7 +160,7 @@ async function getProductById(req, res, next) {
       INNER JOIN Users u ON p.user_id = u.id
       WHERE p.id = ?
     `;
-    const params = [id];
+    const params = [productId];
 
     if (!isAdmin) {
       sql += ' AND p.user_id = ?';
@@ -159,7 +179,7 @@ async function getProductById(req, res, next) {
     const product = products[0];
 
     // Fetch Warranty
-    const warranties = await db.query('SELECT * FROM Warranties WHERE product_id = ?;', [id]);
+    const warranties = await db.query('SELECT * FROM Warranties WHERE product_id = ?;', [productId]);
     let warranty = warranties.length > 0 ? warranties[0] : null;
     if (warranty) {
       const calc = computeWarrantyStatus(warranty.end_date);
@@ -173,13 +193,13 @@ async function getProductById(req, res, next) {
     // Fetch Repairs
     const repairs = await db.query(
       'SELECT * FROM Repairs WHERE product_id = ? ORDER BY repair_date DESC;',
-      [id]
+      [productId]
     );
 
     // Fetch Documents
     const documents = await db.query(
       'SELECT id, document_type, file_name, original_name, file_size, mime_type, upload_date FROM Documents WHERE product_id = ? ORDER BY upload_date DESC;',
-      [id]
+      [productId]
     );
 
     // Total repair cost
@@ -343,7 +363,10 @@ async function createProduct(req, res, next) {
  */
 async function updateProduct(req, res, next) {
   try {
-    const { id } = req.params;
+    const productId = parsePositiveInt(req.params.id);
+    if (!productId || Number.isNaN(productId)) {
+      return res.status(400).json({ success: false, message: 'Product ID must be a valid positive integer.' });
+    }
     const userId = req.user.id;
     const isAdmin = req.user.role === 'Admin';
 
@@ -351,7 +374,7 @@ async function updateProduct(req, res, next) {
     const checkSql = isAdmin 
       ? 'SELECT id FROM Products WHERE id = ?;'
       : 'SELECT id FROM Products WHERE id = ? AND user_id = ?;';
-    const checkParams = isAdmin ? [id] : [id, userId];
+    const checkParams = isAdmin ? [productId] : [productId, userId];
 
     const existing = await db.query(checkSql, checkParams);
     if (existing.length === 0) {
@@ -404,13 +427,13 @@ async function updateProduct(req, res, next) {
         currency || 'USD',
         retailer ? retailer.trim() : null,
         notes ? notes.trim() : null,
-        id
+        productId
       ]
     );
 
     // Update or Insert Warranty
     if (provider_name || end_date) {
-      const existingWty = await db.query('SELECT id FROM Warranties WHERE product_id = ?;', [id]);
+      const existingWty = await db.query('SELECT id FROM Warranties WHERE product_id = ?;', [productId]);
       const calc = computeWarrantyStatus(end_date);
 
       if (existingWty.length > 0) {
@@ -442,7 +465,7 @@ async function updateProduct(req, res, next) {
             support_contact, status
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
           [
-            id,
+            productId,
             provider_name,
             policy_number || null,
             warranty_type || 'Manufacturer',
@@ -461,7 +484,7 @@ async function updateProduct(req, res, next) {
       userId,
       action: 'PRODUCT_UPDATED',
       entityType: 'Product',
-      entityId: id,
+      entityId: productId,
       details: `Updated product "${name}"`,
       ipAddress: req.ip
     });
@@ -480,14 +503,17 @@ async function updateProduct(req, res, next) {
  */
 async function deleteProduct(req, res, next) {
   try {
-    const { id } = req.params;
+    const productId = parsePositiveInt(req.params.id);
+    if (!productId || Number.isNaN(productId)) {
+      return res.status(400).json({ success: false, message: 'Product ID must be a valid positive integer.' });
+    }
     const userId = req.user.id;
     const isAdmin = req.user.role === 'Admin';
 
     const checkSql = isAdmin 
       ? 'SELECT id, name FROM Products WHERE id = ?;'
       : 'SELECT id, name FROM Products WHERE id = ? AND user_id = ?;';
-    const checkParams = isAdmin ? [id] : [id, userId];
+    const checkParams = isAdmin ? [productId] : [productId, userId];
 
     const prods = await db.query(checkSql, checkParams);
     if (prods.length === 0) {
@@ -496,17 +522,28 @@ async function deleteProduct(req, res, next) {
 
     const prodName = prods[0].name;
 
+    // Delete all associated document blobs/files before removing database records
+    const attachedDocs = await db.query(
+      'SELECT id, storage_path, storage_type FROM Documents WHERE product_id = ?;',
+      [productId]
+    );
+    for (const doc of attachedDocs) {
+      if (doc && doc.storage_path) {
+        await blobStorage.deleteFile(doc.storage_path, doc.storage_type);
+      }
+    }
+
     // Delete cascading
-    await db.run('DELETE FROM Documents WHERE product_id = ?;', [id]);
-    await db.run('DELETE FROM Repairs WHERE product_id = ?;', [id]);
-    await db.run('DELETE FROM Warranties WHERE product_id = ?;', [id]);
-    await db.run('DELETE FROM Products WHERE id = ?;', [id]);
+    await db.run('DELETE FROM Documents WHERE product_id = ?;', [productId]);
+    await db.run('DELETE FROM Repairs WHERE product_id = ?;', [productId]);
+    await db.run('DELETE FROM Warranties WHERE product_id = ?;', [productId]);
+    await db.run('DELETE FROM Products WHERE id = ?;', [productId]);
 
     await logActivity({
       userId,
       action: 'PRODUCT_DELETED',
       entityType: 'Product',
-      entityId: id,
+      entityId: productId,
       details: `Deleted product "${prodName}"`,
       ipAddress: req.ip
     });

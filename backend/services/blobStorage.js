@@ -13,6 +13,21 @@ function isAzureBlobConfigured(storageCfg = config.AZURE_STORAGE) {
 }
 
 /**
+ * Ensures Azure Blob Storage is active in production unless explicitly overridden.
+ */
+function assertProductionStorageConfigured() {
+  if (
+    (config.NODE_ENV === 'production' || process.env.AZURE_STRICT_STORAGE === 'true') &&
+    process.env.ALLOW_LOCAL_STORAGE_IN_PRODUCTION !== 'true' &&
+    storageMode !== 'AZURE_BLOB'
+  ) {
+    throw new Error(
+      'AZURE_STORAGE_ACCOUNT_NAME must be configured in production to store documents in Azure Blob Storage. Local disk storage fallback is disabled in production.'
+    );
+  }
+}
+
+/**
  * Creates Azure Blob Storage SDK clients using DefaultAzureCredential (no storage account keys).
  */
 function createBlobStorageClients(storageCfg = config.AZURE_STORAGE) {
@@ -68,14 +83,19 @@ if (isAzureBlobConfigured(config.AZURE_STORAGE)) {
  */
 async function ensurePrivateContainer() {
   if (!containerClient) return;
+  const alreadyExists = await containerClient.exists().catch(() => false);
+  if (alreadyExists) {
+    return;
+  }
+
   try {
     await containerClient.createIfNotExists();
   } catch (err) {
     // Container-scoped Storage Blob Data Contributor RBAC may forbid createContainer while allowing blob ops
     const statusCode = err && (err.statusCode || err.code);
     if (statusCode === 403 || statusCode === 409) {
-      const exists = await containerClient.exists().catch(() => false);
-      if (exists) return;
+      const existsAfter = await containerClient.exists().catch(() => false);
+      if (existsAfter) return;
     }
     throw err;
   }
@@ -107,8 +127,10 @@ function resolveSafeLocalPath(storagePath) {
  * @param {number} userId User ID for folder segregation
  */
 async function uploadFile(file, userId) {
+  assertProductionStorageConfigured();
   const timestamp = Date.now();
-  const safeFilename = `${timestamp}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+  const baseName = path.posix.basename(String(file.originalname || 'document').replace(/\\/g, '/'));
+  const safeFilename = `${timestamp}-${baseName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
 
   // If Azure Blob Storage is active
   if (storageMode === 'AZURE_BLOB' && containerClient) {
@@ -134,7 +156,7 @@ async function uploadFile(file, userId) {
     };
   }
 
-  // Local Disk Storage Fallback (only when Azure Blob is not configured)
+  // Local Disk Storage Fallback (only when Azure Blob is not configured in non-production)
   const userFolder = path.join(config.UPLOAD_DIR, `user_${userId}`);
   if (!fs.existsSync(userFolder)) {
     fs.mkdirSync(userFolder, { recursive: true });
@@ -205,7 +227,9 @@ async function getFileStream(storagePath, storageType) {
         };
       }
     }
-    throw new Error('File not found on storage server');
+    const notFoundErr = new Error('File not found on storage server');
+    notFoundErr.statusCode = 404;
+    throw notFoundErr;
   }
 
   return {
@@ -280,7 +304,8 @@ async function listFiles({ userId = null, prefix = '' } = {}) {
  * Deletes a file from Azure Blob or Local Disk
  */
 async function deleteFile(storagePath, storageType) {
-  if (storageType === 'AzureBlob' && containerClient) {
+  if (storageType === 'AzureBlob') {
+    if (!containerClient) return false;
     const blockBlobClient = containerClient.getBlockBlobClient(storagePath);
     const result = await blockBlobClient.deleteIfExists();
     return Boolean(result.succeeded);
@@ -292,6 +317,16 @@ async function deleteFile(storagePath, storageType) {
     return true;
   }
   return false;
+}
+
+function initStorage() {
+  assertProductionStorageConfigured();
+  return {
+    storageMode,
+    storageAuthMode,
+    containerName: config.AZURE_STORAGE.containerName,
+    accountName: config.AZURE_STORAGE.accountName || null
+  };
 }
 
 function getStorageMode() {
@@ -311,6 +346,8 @@ function getAccountName() {
 }
 
 module.exports = {
+  initStorage,
+  assertProductionStorageConfigured,
   uploadFile,
   getFileStream,
   listFiles,

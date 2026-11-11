@@ -1,13 +1,50 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
 const { Readable } = require('stream');
+const config = require('../config/env');
 const { app } = require('../server');
 const db = require('../services/db');
 const blobStorage = require('../services/blobStorage');
 const adminController = require('../controllers/adminController');
-const { splitSqlBatches } = require('../scripts/initAzureSql');
+const { splitSqlBatches, DEFAULT_CATEGORIES } = require('../scripts/initAzureSql');
 const { readLocalSnapshot } = require('../scripts/migrateLocalToAzure');
+const { REQUIRED_TABLES, EXPECTED_INDEXES, classifyAzureSqlError } = require('../scripts/testAzureSql');
+const { classifyAzureBlobError } = require('../scripts/testAzureBlob');
+
+function buildMultipartPayload(fields = {}, file = null) {
+  const boundary = `----WarrantyWiseBoundary${Date.now()}${Math.random().toString(16).slice(2)}`;
+  const parts = [];
+
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined || value === null) continue;
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${String(value)}\r\n`,
+        'utf8'
+      )
+    );
+  }
+
+  if (file) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${file.fieldName || 'file'}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType || 'application/octet-stream'}\r\n\r\n`,
+        'utf8'
+      )
+    );
+    parts.push(Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(String(file.buffer || '')));
+    parts.push(Buffer.from('\r\n', 'utf8'));
+  }
+
+  parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
+  return {
+    boundary,
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    buffer: Buffer.concat(parts)
+  };
+}
 
 function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null }) {
   return new Promise((resolve) => {
@@ -16,16 +53,22 @@ function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null 
       normalizedHeaders[k.toLowerCase()] = v;
     }
 
-    if (body) {
-      if (!normalizedHeaders['content-type']) {
-        normalizedHeaders['content-type'] = 'application/json';
+    const isRawBuffer = Buffer.isBuffer(body);
+    let bodyBuffer = Buffer.alloc(0);
+    if (body !== null && body !== undefined) {
+      if (isRawBuffer) {
+        bodyBuffer = body;
+      } else {
+        if (!normalizedHeaders['content-type']) {
+          normalizedHeaders['content-type'] = 'application/json';
+        }
+        const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
+        bodyBuffer = Buffer.from(bodyStr);
       }
-      const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
-      normalizedHeaders['content-length'] = Buffer.byteLength(bodyStr).toString();
+      if (!normalizedHeaders['content-length']) {
+        normalizedHeaders['content-length'] = bodyBuffer.length.toString();
+      }
     }
-
-    const bodyStr = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : '';
-    const bodyBuffer = Buffer.from(bodyStr);
 
     let sent = false;
     const req = new Readable({
@@ -43,8 +86,8 @@ function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null 
     req.url = url;
     req.originalUrl = url;
     req.headers = normalizedHeaders;
-    // Pre-populate req.body so express body parser or handlers have it directly
-    if (body && typeof body === 'object') {
+    // Pre-populate req.body only for parsed JSON objects, never for raw multipart streams
+    if (body && typeof body === 'object' && !isRawBuffer) {
       req.body = { ...body };
     }
     req.connection = { remoteAddress: '127.0.0.1' };
@@ -53,9 +96,12 @@ function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null 
     let statusCode = 200;
     const responseHeaders = {};
     let responseBody = '';
+    const chunks = [];
 
     const res = new EventEmitter();
     res.statusCode = 200;
+    res.writable = true;
+    res.headersSent = false;
     res.setHeader = (name, value) => {
       responseHeaders[name.toLowerCase()] = value;
     };
@@ -65,7 +111,15 @@ function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null 
       res.statusCode = code;
       return res;
     };
+    res.write = (chunk) => {
+      res.headersSent = true;
+      if (chunk !== undefined && chunk !== null) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return true;
+    };
     res.json = (data) => {
+      res.headersSent = true;
       responseHeaders['content-type'] = 'application/json';
       responseBody = data;
       resolve({
@@ -76,6 +130,7 @@ function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null 
       res.emit('finish');
     };
     res.send = (data) => {
+      res.headersSent = true;
       responseBody = data;
       let parsed = data;
       try {
@@ -90,11 +145,16 @@ function simulateRequest({ method = 'GET', url = '/', headers = {}, body = null 
       res.emit('finish');
     };
     res.end = (data) => {
-      if (data) responseBody = data;
+      res.headersSent = true;
+      if (data) {
+        chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      }
+      const rawBuffer = chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0);
       resolve({
         status: statusCode,
         headers: responseHeaders,
-        data: responseBody
+        data: chunks.length > 0 ? rawBuffer : responseBody,
+        rawBuffer
       });
       res.emit('finish');
     };
@@ -108,20 +168,34 @@ async function runTestSuite() {
   console.log('🧪 WARRANTYWISE AUTOMATED INTEGRATION TEST SUITE');
   console.log('===============================================================\n');
 
-  await db.initDb();
+  // Isolate SQLite & disk storage in a temp sandbox so real local DB & uploads remain untouched
+  const origLocalDbPath = config.LOCAL_DB_PATH;
+  const origUploadDir = config.UPLOAD_DIR;
+  const testSandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'warrantywise-api-test-'));
+  const tempDbPath = path.join(testSandboxDir, 'warrantywise.db');
+  const tempUploadDir = path.join(testSandboxDir, 'uploads');
+
+  if (fs.existsSync(origLocalDbPath)) {
+    fs.copyFileSync(origLocalDbPath, tempDbPath);
+  }
+  config.LOCAL_DB_PATH = tempDbPath;
+  config.UPLOAD_DIR = tempUploadDir;
 
   let passed = 0;
   let failed = 0;
 
-  function assert(condition, name) {
-    if (condition) {
-      console.log(`  ✅ PASS: ${name}`);
-      passed++;
-    } else {
-      console.error(`  ❌ FAIL: ${name}`);
-      failed++;
+  try {
+    await db.initDb();
+
+    function assert(condition, name) {
+      if (condition) {
+        console.log(`  ✅ PASS: ${name}`);
+        passed++;
+      } else {
+        console.error(`  ❌ FAIL: ${name}`);
+        failed++;
+      }
     }
-  }
 
   // 1. Health Check & Database Enforcement
   console.log('--- Suite 1: Health & System Diagnostics ---');
@@ -553,6 +627,593 @@ async function runTestSuite() {
   });
   assert(listRepairs.status === 200 && listRepairs.data.total_expenditure > 0, `Repairs ledger retrieved with expenditure total ($${listRepairs.data.total_expenditure})`);
 
+  // 13b. Document Vault Upload, Download, Listing, Validation, Access Control & Deletion
+  console.log('\n--- Suite 4b: Document Vault, Access Control & Storage Lifecycle ---');
+  const uploadMiddleware = require('../middleware/uploadMiddleware');
+  const initialStoredFiles = await blobStorage.listFiles({});
+  const docProdRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/products',
+    headers: { 'Authorization': `Bearer ${demoToken}` },
+    body: {
+      name: 'Document Lifecycle Test Device',
+      brand: 'Anker',
+      category_id: 1,
+      purchase_date: '2026-09-01',
+      purchase_price: 99.00
+    }
+  });
+  const docProdId = docProdRes.data?.data?.id;
+  const secondDocProdRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/products',
+    headers: { 'Authorization': `Bearer ${demoToken}` },
+    body: {
+      name: 'Second Document Lifecycle Device',
+      brand: 'Belkin',
+      category_id: 1,
+      purchase_date: '2026-09-02',
+      purchase_price: 49.00
+    }
+  });
+  const secondDocProdId = secondDocProdRes.data?.data?.id;
+  const uploadRootDir = config.UPLOAD_DIR;
+
+  // Upload valid PDF document
+  const pdfPayloadBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n', 'utf8');
+  const validUploadMp = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'Invoice' },
+    { filename: 'invoice-anker-2026.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const uploadRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': validUploadMp.contentType,
+      'Content-Length': String(validUploadMp.buffer.length)
+    },
+    body: validUploadMp.buffer
+  });
+  const uploadedDocId = uploadRes.data?.data?.id;
+  const uploadedDocRows = uploadedDocId
+    ? await db.query('SELECT * FROM Documents WHERE id = ?;', [uploadedDocId])
+    : [];
+  const uploadedDocRow = uploadedDocRows[0];
+  const uploadedDiskPath = uploadedDocRow ? path.resolve(uploadRootDir, uploadedDocRow.storage_path) : '';
+  assert(
+    uploadRes.status === 201 &&
+    uploadRes.data.success &&
+    uploadedDocRow &&
+    uploadedDocRow.user_id === 2 &&
+    uploadedDocRow.product_id === docProdId &&
+    uploadedDocRow.storage_path.startsWith('user_2/') &&
+    fs.existsSync(uploadedDiskPath),
+    'Document upload succeeds, stores file in user-scoped folder, and links user_id + product_id in database'
+  );
+
+  // List documents & verify association
+  const listDocsRes = await simulateRequest({
+    method: 'GET',
+    url: `/api/documents?product_id=${docProdId}`,
+    headers: { 'Authorization': `Bearer ${demoToken}` }
+  });
+  assert(
+    listDocsRes.status === 200 &&
+    listDocsRes.data.data.some((d) => d.id === uploadedDocId && d.original_name === 'invoice-anker-2026.pdf'),
+    'GET /api/documents returns newly uploaded document linked to product'
+  );
+
+  // Download document and verify exact bytes & headers
+  const downloadRes = await simulateRequest({
+    method: 'GET',
+    url: `/api/documents/${uploadedDocId}/download`,
+    headers: { 'Authorization': `Bearer ${demoToken}` }
+  });
+  assert(
+    downloadRes.status === 200 &&
+    Buffer.isBuffer(downloadRes.rawBuffer) &&
+    downloadRes.rawBuffer.equals(pdfPayloadBytes) &&
+    /attachment;/i.test(downloadRes.headers['content-disposition'] || '') &&
+    downloadRes.headers['x-content-type-options'] === 'nosniff',
+    'GET /api/documents/:id/download streams exact file bytes with attachment + nosniff headers'
+  );
+
+  // Cross-user isolation (IDOR checks for download, delete, and cross-user upload)
+  const crossDownloadRes = await simulateRequest({
+    method: 'GET',
+    url: `/api/documents/${uploadedDocId}/download`,
+    headers: { 'Authorization': `Bearer ${otherToken}` }
+  });
+  const crossDeleteRes = await simulateRequest({
+    method: 'DELETE',
+    url: `/api/documents/${uploadedDocId}`,
+    headers: { 'Authorization': `Bearer ${otherToken}` }
+  });
+  const crossUploadMp = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'Invoice' },
+    { filename: 'hijack.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const crossUploadRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${otherToken}`,
+      'Content-Type': crossUploadMp.contentType,
+      'Content-Length': String(crossUploadMp.buffer.length)
+    },
+    body: crossUploadMp.buffer
+  });
+  assert(
+    crossDownloadRes.status === 404 &&
+    crossDeleteRes.status === 404 &&
+    crossUploadRes.status === 404,
+    'Cross-user document download, delete, and upload against another user product are blocked (404)'
+  );
+
+  // Validate product_id & repair_id must be valid positive integers
+  const invalidIdsChecks = [];
+  for (const badProdId of ['', 'abc', '1.5', '0', '-2', '12abc']) {
+    const mp = buildMultipartPayload(
+      { product_id: badProdId, document_type: 'Invoice' },
+      { filename: 'bad-prod-id.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+    );
+    const r = await simulateRequest({
+      method: 'POST',
+      url: '/api/documents/upload',
+      headers: {
+        'Authorization': `Bearer ${demoToken}`,
+        'Content-Type': mp.contentType,
+        'Content-Length': String(mp.buffer.length)
+      },
+      body: mp.buffer
+    });
+    invalidIdsChecks.push(r.status === 400 && !r.data.success);
+  }
+  for (const badRepId of ['abc', '2.5', '0', '-7', '9abc']) {
+    const mp = buildMultipartPayload(
+      { product_id: docProdId, repair_id: badRepId, document_type: 'Repair Receipt' },
+      { filename: 'bad-repair-id.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+    );
+    const r = await simulateRequest({
+      method: 'POST',
+      url: '/api/documents/upload',
+      headers: {
+        'Authorization': `Bearer ${demoToken}`,
+        'Content-Type': mp.contentType,
+        'Content-Length': String(mp.buffer.length)
+      },
+      body: mp.buffer
+    });
+    invalidIdsChecks.push(r.status === 400 && !r.data.success);
+  }
+  const badQueryProdRes = await simulateRequest({
+    method: 'GET',
+    url: '/api/documents?product_id=notanint',
+    headers: { 'Authorization': `Bearer ${demoToken}` }
+  });
+  const badQueryRepRes = await simulateRequest({
+    method: 'GET',
+    url: '/api/documents?repair_id=-1',
+    headers: { 'Authorization': `Bearer ${demoToken}` }
+  });
+  const badParamProdRes = await simulateRequest({
+    method: 'GET',
+    url: '/api/products/notanint',
+    headers: { 'Authorization': `Bearer ${demoToken}` }
+  });
+  assert(
+    invalidIdsChecks.every(Boolean) &&
+    badQueryProdRes.status === 400 &&
+    badQueryRepRes.status === 400 &&
+    badParamProdRes.status === 400,
+    'Upload, query, and route validation reject non-integer/zero/negative product_id and repair_id with HTTP 400'
+  );
+
+  // Repair association checks: valid same-product+user succeeds (201); different product same user rejected (400); missing or other user repair rejected (404)
+  const validRepairDocMp = buildMultipartPayload(
+    { product_id: newProdId, repair_id: newRepairId, document_type: 'Repair Receipt' },
+    { filename: 'valid-repair-receipt.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const validRepairDocRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': validRepairDocMp.contentType,
+      'Content-Length': String(validRepairDocMp.buffer.length)
+    },
+    body: validRepairDocMp.buffer
+  });
+  const validRepairDocId = validRepairDocRes.data?.data?.id;
+  if (validRepairDocId) {
+    await simulateRequest({
+      method: 'DELETE',
+      url: `/api/documents/${validRepairDocId}`,
+      headers: { 'Authorization': `Bearer ${demoToken}` }
+    });
+  }
+
+  const mismatchRepairDocMp = buildMultipartPayload(
+    { product_id: secondDocProdId, repair_id: newRepairId, document_type: 'Repair Receipt' },
+    { filename: 'wrong-product-repair.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const mismatchRepairDocRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': mismatchRepairDocMp.contentType,
+      'Content-Length': String(mismatchRepairDocMp.buffer.length)
+    },
+    body: mismatchRepairDocMp.buffer
+  });
+
+  const sarahProdRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/products',
+    headers: { 'Authorization': `Bearer ${otherToken}` },
+    body: {
+      name: 'Sarah Isolation Phone',
+      brand: 'Google',
+      category_id: 2,
+      purchase_date: '2026-09-01',
+      purchase_price: 799
+    }
+  });
+  const sarahProdId = sarahProdRes.data?.data?.id;
+  const sarahRepairRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/repairs',
+    headers: { 'Authorization': `Bearer ${otherToken}` },
+    body: {
+      product_id: sarahProdId,
+      repair_date: '2026-09-05',
+      service_center: 'Google Repair Lab',
+      issue_description: 'Battery calibration check',
+      cost: 0
+    }
+  });
+  const sarahRepairId = sarahRepairRes.data?.data?.id;
+  const crossUserRepairDocMp = buildMultipartPayload(
+    { product_id: docProdId, repair_id: sarahRepairId, document_type: 'Repair Receipt' },
+    { filename: 'cross-user-repair.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const crossUserRepairDocRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': crossUserRepairDocMp.contentType,
+      'Content-Length': String(crossUserRepairDocMp.buffer.length)
+    },
+    body: crossUserRepairDocMp.buffer
+  });
+  await simulateRequest({
+    method: 'DELETE',
+    url: `/api/products/${sarahProdId}`,
+    headers: { 'Authorization': `Bearer ${otherToken}` }
+  });
+
+  const badRepairDocMp = buildMultipartPayload(
+    { product_id: docProdId, repair_id: 999999, document_type: 'Repair Receipt' },
+    { filename: 'orphan-repair.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const badRepairDocRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': badRepairDocMp.contentType,
+      'Content-Length': String(badRepairDocMp.buffer.length)
+    },
+    body: badRepairDocMp.buffer
+  });
+
+  assert(
+    validRepairDocRes.status === 201 &&
+    validRepairDocRes.data.data.repair_id === newRepairId &&
+    mismatchRepairDocRes.status === 400 &&
+    crossUserRepairDocRes.status === 404 &&
+    badRepairDocRes.status === 404,
+    'repair_id allows matching product+user (201) and blocks cross-product (400), cross-user (404), and nonexistent repairs (404)'
+  );
+
+  // Validation: dangerous extensions (even spoofed MIME), invalid MIME types, mismatched PDF extension, empty 0-byte file, invalid document_type
+  const dangerousCases = [
+    { filename: 'malware.exe', contentType: 'application/x-msdownload', buffer: Buffer.from('MZ') },
+    { filename: 'spoofed.sh', contentType: 'application/pdf', buffer: pdfPayloadBytes },
+    { filename: 'payload.exe.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes },
+    { filename: 'xss.svg', contentType: 'image/svg+xml', buffer: Buffer.from('<svg></svg>') },
+    { filename: 'script.ps1 ', contentType: 'image/png', buffer: Buffer.from('test') },
+    { filename: 'notes.txt', contentType: 'text/plain', buffer: Buffer.from('hello') },
+    { filename: 'mismatch.pdf', contentType: 'image/png', buffer: Buffer.from('not-a-pdf') }
+  ];
+  const dangerousStatuses = [];
+  for (const tc of dangerousCases) {
+    const mp = buildMultipartPayload(
+      { product_id: docProdId, document_type: 'Invoice' },
+      tc
+    );
+    const r = await simulateRequest({
+      method: 'POST',
+      url: '/api/documents/upload',
+      headers: {
+        'Authorization': `Bearer ${demoToken}`,
+        'Content-Type': mp.contentType,
+        'Content-Length': String(mp.buffer.length)
+      },
+      body: mp.buffer
+    });
+    dangerousStatuses.push(r.status);
+  }
+
+  const emptyFileMp = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'Invoice' },
+    { filename: 'empty.pdf', contentType: 'application/pdf', buffer: Buffer.alloc(0) }
+  );
+  const emptyFileRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': emptyFileMp.contentType,
+      'Content-Length': String(emptyFileMp.buffer.length)
+    },
+    body: emptyFileMp.buffer
+  });
+
+  const badTypeMp = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'NotAllowedType' },
+    { filename: 'typecheck.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const badTypeRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': badTypeMp.contentType,
+      'Content-Length': String(badTypeMp.buffer.length)
+    },
+    body: badTypeMp.buffer
+  });
+
+  // 10 MB upload limit enforcement check (10 MB + 1 byte rejected with HTTP 400)
+  const oversizedMp = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'Invoice' },
+    { filename: 'oversized.pdf', contentType: 'application/pdf', buffer: Buffer.alloc(10 * 1024 * 1024 + 1, 0x25) }
+  );
+  const oversizedRes = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': oversizedMp.contentType,
+      'Content-Length': String(oversizedMp.buffer.length)
+    },
+    body: oversizedMp.buffer
+  });
+
+  assert(
+    dangerousStatuses.every((s) => s === 400) &&
+    emptyFileRes.status === 400 &&
+    badTypeRes.status === 400 &&
+    uploadMiddleware.limits.fileSize === 10 * 1024 * 1024 &&
+    oversizedRes.status === 400,
+    'Upload rejects dangerous/invalid extensions & MIME types (400), 0-byte empty files (400), invalid document_type (400), and >10 MB files (400)'
+  );
+
+  // DB insert failure rollback: delete uploaded file if Documents DB INSERT fails (no orphan blobs/files)
+  const filesBeforeRollback = await blobStorage.listFiles({ userId: 2 });
+  const docsCountBeforeRollback = (await db.query('SELECT COUNT(*) AS count FROM Documents;'))[0].count;
+  const origDbRun = db.run;
+  const origUploadFile = blobStorage.uploadFile;
+  const origDeleteFile = blobStorage.deleteFile;
+  let capturedRollbackUpload = null;
+  let rollbackDeleteCall = null;
+  let rollbackRes = null;
+
+  try {
+    blobStorage.uploadFile = async (...args) => {
+      const res = await origUploadFile(...args);
+      capturedRollbackUpload = res;
+      return res;
+    };
+    blobStorage.deleteFile = async (storagePath, storageType) => {
+      rollbackDeleteCall = { storagePath, storageType };
+      return origDeleteFile(storagePath, storageType);
+    };
+    db.run = async (sqlText, params) => {
+      if (/INSERT\s+INTO\s+Documents\b/i.test(sqlText)) {
+        throw new Error('Simulated DB insert failure after storage upload');
+      }
+      return origDbRun(sqlText, params);
+    };
+
+    const rollbackMp = buildMultipartPayload(
+      { product_id: docProdId, document_type: 'Invoice' },
+      { filename: 'rollback-orphan-check.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+    );
+    rollbackRes = await simulateRequest({
+      method: 'POST',
+      url: '/api/documents/upload',
+      headers: {
+        'Authorization': `Bearer ${demoToken}`,
+        'Content-Type': rollbackMp.contentType,
+        'Content-Length': String(rollbackMp.buffer.length)
+      },
+      body: rollbackMp.buffer
+    });
+  } finally {
+    db.run = origDbRun;
+    blobStorage.uploadFile = origUploadFile;
+    blobStorage.deleteFile = origDeleteFile;
+  }
+
+  const filesAfterRollback = await blobStorage.listFiles({ userId: 2 });
+  const docsCountAfterRollback = (await db.query('SELECT COUNT(*) AS count FROM Documents;'))[0].count;
+  const rolledBackDiskPath = capturedRollbackUpload
+    ? path.resolve(uploadRootDir, capturedRollbackUpload.storagePath)
+    : '';
+  assert(
+    rollbackRes &&
+    rollbackRes.status === 500 &&
+    capturedRollbackUpload &&
+    rollbackDeleteCall &&
+    rollbackDeleteCall.storagePath === capturedRollbackUpload.storagePath &&
+    rollbackDeleteCall.storageType === capturedRollbackUpload.storageType &&
+    !fs.existsSync(rolledBackDiskPath) &&
+    filesAfterRollback.length === filesBeforeRollback.length &&
+    docsCountAfterRollback === docsCountBeforeRollback,
+    'DB insert failure after upload rolls back and deletes uploaded file cleanly with zero orphans'
+  );
+
+  // Also verify rollback behavior when storageType is AzureBlob
+  let azureRollbackDeleted = null;
+  try {
+    blobStorage.uploadFile = async () => ({
+      storageType: 'AzureBlob',
+      storagePath: 'user_2/1700000000000-azure-rollback.pdf',
+      fileName: '1700000000000-azure-rollback.pdf'
+    });
+    blobStorage.deleteFile = async (storagePath, storageType) => {
+      azureRollbackDeleted = { storagePath, storageType };
+      return true;
+    };
+    db.run = async (sqlText, params) => {
+      if (/INSERT\s+INTO\s+Documents\b/i.test(sqlText)) {
+        throw new Error('Simulated Azure SQL insert failure');
+      }
+      return origDbRun(sqlText, params);
+    };
+    const azRollbackMp = buildMultipartPayload(
+      { product_id: docProdId, document_type: 'Invoice' },
+      { filename: 'azure-rollback.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+    );
+    await simulateRequest({
+      method: 'POST',
+      url: '/api/documents/upload',
+      headers: {
+        'Authorization': `Bearer ${demoToken}`,
+        'Content-Type': azRollbackMp.contentType,
+        'Content-Length': String(azRollbackMp.buffer.length)
+      },
+      body: azRollbackMp.buffer
+    });
+  } finally {
+    db.run = origDbRun;
+    blobStorage.uploadFile = origUploadFile;
+    blobStorage.deleteFile = origDeleteFile;
+  }
+  assert(
+    azureRollbackDeleted &&
+    azureRollbackDeleted.storagePath === 'user_2/1700000000000-azure-rollback.pdf' &&
+    azureRollbackDeleted.storageType === 'AzureBlob',
+    'DB insert failure after AzureBlob upload calls blobStorage.deleteFile with AzureBlob storageType'
+  );
+
+  // Delete single document & verify file + DB record removed
+  const deleteDocRes = await simulateRequest({
+    method: 'DELETE',
+    url: `/api/documents/${uploadedDocId}`,
+    headers: { 'Authorization': `Bearer ${demoToken}` }
+  });
+  const docAfterDelete = await db.query('SELECT COUNT(*) AS count FROM Documents WHERE id = ?;', [uploadedDocId]);
+  assert(
+    deleteDocRes.status === 200 &&
+    docAfterDelete[0].count === 0 &&
+    !fs.existsSync(uploadedDiskPath),
+    'DELETE /api/documents/:id removes both stored file and database record'
+  );
+
+  // Upload TWO files + one synthetic AzureBlob DB record to verify product deletion cleans up ALL files/blobs BEFORE deleting DB records
+  const pngHeaderBytes = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D]);
+  const cascadeUploadMp1 = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'Warranty Card' },
+    { filename: 'warranty-card-cascade.pdf', contentType: 'application/pdf', buffer: pdfPayloadBytes }
+  );
+  const cascadeUploadMp2 = buildMultipartPayload(
+    { product_id: docProdId, document_type: 'Other' },
+    { filename: 'product-photo-cascade.png', contentType: 'image/png', buffer: pngHeaderBytes }
+  );
+  const cascadeUploadRes1 = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': cascadeUploadMp1.contentType,
+      'Content-Length': String(cascadeUploadMp1.buffer.length)
+    },
+    body: cascadeUploadMp1.buffer
+  });
+  const cascadeUploadRes2 = await simulateRequest({
+    method: 'POST',
+    url: '/api/documents/upload',
+    headers: {
+      'Authorization': `Bearer ${demoToken}`,
+      'Content-Type': cascadeUploadMp2.contentType,
+      'Content-Length': String(cascadeUploadMp2.buffer.length)
+    },
+    body: cascadeUploadMp2.buffer
+  });
+  const cascadeDocId1 = cascadeUploadRes1.data?.data?.id;
+  const cascadeDocId2 = cascadeUploadRes2.data?.data?.id;
+
+  // Insert one synthetic AzureBlob metadata record attached to the same product
+  const azureRowInsert = await db.run(
+    `INSERT INTO Documents (
+      product_id, user_id, repair_id, document_type,
+      file_name, original_name, file_size, mime_type,
+      storage_path, storage_type
+    ) VALUES (?, ?, NULL, 'Invoice', 'fake-blob.pdf', 'fake-blob.pdf', 128, 'application/pdf', 'user_2/fake-blob.pdf', 'AzureBlob');`,
+    [docProdId, 2]
+  );
+  const azureSyntheticDocId = azureRowInsert.lastInsertRowid;
+
+  const cascadeDocsRows = await db.query(
+    'SELECT id, storage_path, storage_type FROM Documents WHERE product_id = ? ORDER BY id ASC;',
+    [docProdId]
+  );
+  const localDiskCascadePaths = cascadeDocsRows
+    .filter((d) => d.storage_type === 'LocalDisk')
+    .map((d) => path.resolve(uploadRootDir, d.storage_path));
+
+  const deleteOrderEvents = [];
+  try {
+    blobStorage.deleteFile = async (storagePath, storageType) => {
+      const docsStillInDb = (await db.query('SELECT COUNT(*) AS count FROM Documents WHERE product_id = ?;', [docProdId]))[0].count;
+      const prodStillInDb = (await db.query('SELECT COUNT(*) AS count FROM Products WHERE id = ?;', [docProdId]))[0].count;
+      deleteOrderEvents.push({ storagePath, storageType, docsStillInDb, prodStillInDb });
+      if (storageType === 'AzureBlob') return true;
+      return origDeleteFile(storagePath, storageType);
+    };
+
+    await simulateRequest({
+      method: 'DELETE',
+      url: `/api/products/${docProdId}`,
+      headers: { 'Authorization': `Bearer ${demoToken}` }
+    });
+    await simulateRequest({
+      method: 'DELETE',
+      url: `/api/products/${secondDocProdId}`,
+      headers: { 'Authorization': `Bearer ${demoToken}` }
+    });
+  } finally {
+    blobStorage.deleteFile = origDeleteFile;
+  }
+
+  const cascadeDocsRemaining = await db.query('SELECT COUNT(*) AS count FROM Documents WHERE product_id = ?;', [docProdId]);
+  const finalStoredFiles = await blobStorage.listFiles({});
+  assert(
+    deleteOrderEvents.length === 3 &&
+    deleteOrderEvents.every((ev) => ev.docsStillInDb === 3 && ev.prodStillInDb === 1) &&
+    deleteOrderEvents.some((ev) => ev.storageType === 'AzureBlob' && ev.storagePath === 'user_2/fake-blob.pdf') &&
+    cascadeDocsRemaining[0].count === 0 &&
+    localDiskCascadePaths.every((p) => !fs.existsSync(p)) &&
+    finalStoredFiles.length === initialStoredFiles.length,
+    'Deleting product deletes ALL associated AzureBlob and LocalDisk files BEFORE deleting DB records with zero leftover uploads'
+  );
+
   // 14. Analytics Dashboard
   console.log('\n--- Suite 5: Warranty Analytics Dashboard ---');
   const analyticsRes = await simulateRequest({
@@ -728,16 +1389,24 @@ async function runTestSuite() {
   );
 
   // Document storage listing endpoint (scoped per user & admin)
+  const tempUserUploadDir = path.join(config.UPLOAD_DIR, 'user_2');
+  fs.mkdirSync(tempUserUploadDir, { recursive: true });
+  const tempStorageCheckFile = path.join(tempUserUploadDir, 'storage-list-check.pdf');
+  fs.writeFileSync(tempStorageCheckFile, pdfPayloadBytes);
   const userStorageRes = await simulateRequest({
     method: 'GET',
     url: '/api/documents/storage',
     headers: { 'Authorization': `Bearer ${demoToken}` }
   });
+  if (fs.existsSync(tempStorageCheckFile)) {
+    fs.unlinkSync(tempStorageCheckFile);
+  }
   assert(
     userStorageRes.status === 200 &&
     userStorageRes.data.success &&
     userStorageRes.data.container === 'warranty-documents' &&
     Array.isArray(userStorageRes.data.data) &&
+    userStorageRes.data.data.length >= 1 &&
     userStorageRes.data.data.every((f) => f.storagePath.startsWith('user_2/')),
     'GET /api/documents/storage lists user-scoped files inside storage container'
   );
@@ -745,14 +1414,110 @@ async function runTestSuite() {
   // Non-destructive schema.sql + SQL batch splitting + read-only local snapshot check
   const schemaSql = fs.readFileSync(path.resolve(__dirname, '../../database/schema.sql'), 'utf8');
   const viewsSql = fs.readFileSync(path.resolve(__dirname, '../../database/views.sql'), 'utf8');
+  const triggersSql = fs.readFileSync(path.resolve(__dirname, '../../database/triggers.sql'), 'utf8');
   const snapshot = await readLocalSnapshot();
+  const hasAllTablesInSchema = REQUIRED_TABLES.every((t) =>
+    new RegExp(`CREATE\\s+TABLE\\s+dbo\\.${t}\\b`, 'i').test(schemaSql)
+  );
+  const hasAllIndexesInSchema = EXPECTED_INDEXES.every((ix) =>
+    new RegExp(`CREATE\\s+NONCLUSTERED\\s+INDEX\\s+${ix}\\b`, 'i').test(schemaSql)
+  );
   assert(
     !/DROP\s+TABLE/i.test(schemaSql) &&
     /IF\s+OBJECT_ID\(N'dbo\.Users',\s*N'U'\)\s+IS\s+NULL/i.test(schemaSql) &&
+    hasAllTablesInSchema &&
+    hasAllIndexesInSchema &&
+    DEFAULT_CATEGORIES.length === 6 &&
     splitSqlBatches(viewsSql).length === 3 &&
+    /EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+dbo\.Users/i.test(triggersSql) &&
     snapshot.Users.length >= 3 &&
-    snapshot.Products.length >= 9,
-    'database/schema.sql is non-destructive, SQL batches split cleanly, and local SQLite data is intact'
+    snapshot.Products.length >= 8,
+    'database/schema.sql defines all 7 tables + 9 indexes idempotently, triggers.sql guards user deletion, and local SQLite data is intact'
+  );
+
+  // Managed Identity override ignores SQL user/password; explicit sql mode rejects missing credentials
+  const forcedMsiConfig = db.buildAzureSqlConfig({
+    server: 'warrantywise-sql-2026.database.windows.net',
+    database: 'WarrantyWiseDB',
+    authMode: 'managed_identity',
+    user: 'ignored_user',
+    password: 'ignored_password'
+  });
+  let missingSqlCredsError = null;
+  try {
+    db.buildAzureSqlConfig({
+      server: 'warrantywise-sql-2026.database.windows.net',
+      database: 'WarrantyWiseDB',
+      authMode: 'sql',
+      user: '',
+      password: ''
+    });
+  } catch (err) {
+    missingSqlCredsError = err.message;
+  }
+  assert(
+    forcedMsiConfig.authentication?.type === 'azure-active-directory-default' &&
+    !('user' in forcedMsiConfig) &&
+    !('password' in forcedMsiConfig) &&
+    /DB_USER and DB_PASSWORD are required/i.test(missingSqlCredsError || ''),
+    'Managed Identity ignores SQL credentials and DB_AUTH_MODE=sql rejects missing credentials'
+  );
+
+  // Production guard: NODE_ENV=production must NEVER silently fall back to Local SQLite
+  const { execFileSync } = require('child_process');
+  let prodNoServerError = '';
+  try {
+    execFileSync(
+      process.execPath,
+      ['-e', "const db = require('./services/db'); db.initDb().catch((e) => { console.error(e.message); process.exit(42); });"],
+      {
+        cwd: path.resolve(__dirname, '..'),
+        env: {
+          ...process.env,
+          NODE_ENV: 'production',
+          JWT_SECRET: 'ci-verification-secret-only',
+          DB_SERVER: '',
+          ALLOW_SQLITE_IN_PRODUCTION: ''
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      }
+    );
+  } catch (err) {
+    prodNoServerError = String(err.stderr || err.message || '');
+  }
+  const loginTips = classifyAzureSqlError(new Error("Login failed for user '<token-identified principal>'."));
+  assert(
+    /Local SQLite fallback is disabled in production/i.test(prodNoServerError) &&
+    loginTips.some((t) => /CREATE USER \[warrantywise-web-123\] FROM EXTERNAL PROVIDER/i.test(t)),
+    'Production mode refuses Local SQLite fallback when DB_SERVER is unset and diagnostic classifies Managed Identity SQL login errors'
+  );
+
+  // Production guard: NODE_ENV=production must NEVER silently fall back to Local Disk storage
+  let prodNoStorageError = '';
+  try {
+    execFileSync(
+      process.execPath,
+      ['-e', "const blob = require('./services/blobStorage'); blob.initStorage();"],
+      {
+        cwd: path.resolve(__dirname, '..'),
+        env: {
+          ...process.env,
+          NODE_ENV: 'production',
+          JWT_SECRET: 'ci-verification-secret-only',
+          AZURE_STORAGE_ACCOUNT_NAME: '',
+          ALLOW_LOCAL_STORAGE_IN_PRODUCTION: ''
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      }
+    );
+  } catch (err) {
+    prodNoStorageError = String(err.stderr || err.message || '');
+  }
+  const blobRbacTips = classifyAzureBlobError({ code: 'AuthorizationPermissionMismatch', statusCode: 403, message: '403' });
+  assert(
+    /Local disk storage fallback is disabled in production/i.test(prodNoStorageError) &&
+    blobRbacTips.some((t) => /Storage Blob Data Contributor/i.test(t)),
+    'Production mode refuses Local Disk storage fallback when AZURE_STORAGE_ACCOUNT_NAME is unset and diagnostic classifies Storage Blob Data Contributor 403'
   );
 
   console.log('\n===============================================================');
@@ -760,7 +1525,13 @@ async function runTestSuite() {
   console.log('===============================================================\n');
 
   if (failed > 0) {
-    process.exit(1);
+    process.exitCode = 1;
+  }
+  } finally {
+    config.LOCAL_DB_PATH = origLocalDbPath;
+    config.UPLOAD_DIR = origUploadDir;
+    await db.closeDb().catch(() => {});
+    fs.rmSync(testSandboxDir, { recursive: true, force: true });
   }
 }
 
