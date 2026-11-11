@@ -1,0 +1,60 @@
+# Node dependencies & package caches
+node_modules/
+.npm
+.pnp.*
+
+# Build outputs & Vite caches
+dist/
+frontend/dist/
+build/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Local SQLite databases & uploaded user documents
+backend/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backend/uploads/
+
+# Environment variables & secrets (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Cloud credentials, certificates & deployment packages
+.azure/
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.PublishSettings
+*.pubxml
+*credentials*.json
+*service-account*.json
+*.zip
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Operating System files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE & editor configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+
